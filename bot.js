@@ -4,69 +4,112 @@ const TG_CHAT = '-5063208066';
 
 let seenTasks = new Set();
 let seenComments = new Set();
-let firstRun = true;
+let initialized = false;
 
 async function fbGet(path) {
-  const r = await fetch('https://favor-board-default-rtdb.europe-west1.firebasedatabase.app/' + path + '.json');
-  return r.ok ? r.json() : null;
+  try {
+    const r = await fetch(DB + '/' + path + '.json');
+    return r.ok ? r.json() : null;
+  } catch(e) { return null; }
+}
+
+async function fbPatch(path, data) {
+  try {
+    await fetch(DB + '/' + path + '.json', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+  } catch(e) {}
 }
 
 async function tgSend(text) {
   try {
-    await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
+    const r = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text: text, parse_mode: 'HTML' })
+      body: JSON.stringify({ chat_id: TG_CHAT, text: text })
     });
-    console.log('Sent: ' + text.substring(0, 60));
-  } catch (e) {
-    console.error('Telegram error: ' + e.message);
+    const d = await r.json();
+    if(d.ok) console.log('Sent: ' + text.substring(0, 80));
+    else console.error('TG error:', d.description);
+  } catch(e) { console.error('TG fetch error:', e.message); }
+}
+
+async function loadSeenFromFirebase() {
+  const raw = await fbGet('bot_seen');
+  if(raw) {
+    if(raw.tasks) raw.tasks.forEach(function(id) { seenTasks.add(id); });
+    if(raw.comments) raw.comments.forEach(function(id) { seenComments.add(id); });
   }
+  console.log('Loaded seen: ' + seenTasks.size + ' tasks, ' + seenComments.size + ' comments');
+}
+
+async function saveSeenToFirebase() {
+  await fbPatch('bot_seen', {
+    tasks: Array.from(seenTasks).slice(-1000),
+    comments: Array.from(seenComments).slice(-1000)
+  });
 }
 
 async function checkAll() {
   const raw = await fbGet('tasks');
-  if (!raw || typeof raw !== 'object') return;
+  if(!raw || typeof raw !== 'object') return;
 
-  const tasks = Object.entries(raw).map(function(entry) {
-    return Object.assign({ id: entry[0] }, entry[1]);
+  const tasks = Object.entries(raw).map(function(e) {
+    return Object.assign({ id: e[0] }, e[1]);
   });
 
-  for (const task of tasks) {
-    if (!seenTasks.has(task.id)) {
-      if (!firstRun) {
-        const msg = task.desc
-          ? 'New favor from ' + task.author + '\n' + task.title + '\n' + task.desc + '\n\nOpen FavorBoard to help!'
-          : 'New favor from ' + task.author + '\n' + task.title + '\n\nOpen FavorBoard to help!';
+  let changed = false;
+
+  for(var i = 0; i < tasks.length; i++) {
+    var task = tasks[i];
+
+    if(!seenTasks.has(task.id)) {
+      if(initialized) {
+        var msg = 'New favor from ' + task.author + '\n' + task.title;
+        if(task.desc) msg += '\n' + task.desc;
+        if(task.deadline) msg += '\nDeadline: ' + new Date(task.deadline).toLocaleString();
+        msg += '\n\nOpen FavorBoard to help!';
         await tgSend(msg);
       }
       seenTasks.add(task.id);
+      changed = true;
     }
 
-    const commentsRaw = await fbGet('comments/' + task.id);
-    if (commentsRaw && typeof commentsRaw === 'object') {
-      const comments = Object.entries(commentsRaw).map(function(entry) {
-        return Object.assign({ id: entry[0] }, entry[1]);
+    var commentsRaw = await fbGet('comments/' + task.id);
+    if(commentsRaw && typeof commentsRaw === 'object') {
+      var comments = Object.entries(commentsRaw).map(function(e) {
+        return Object.assign({ id: e[0] }, e[1]);
       });
-      for (const comment of comments) {
-        if (!seenComments.has(comment.id)) {
-          if (!firstRun) {
-            const msg = comment.author + ' replied on "' + task.title + '"\n' + comment.text + '\n\nOpen FavorBoard to respond!';
-            await tgSend(msg);
+      for(var j = 0; j < comments.length; j++) {
+        var comment = comments[j];
+        if(!seenComments.has(comment.id)) {
+          if(initialized) {
+            var cmsg = comment.author + ' replied on "' + task.title + '"';
+            if(comment.text) cmsg += '\n' + comment.text;
+            if(comment.imageUrl) cmsg += '\n[photo attached]';
+            cmsg += '\n\nOpen FavorBoard to respond!';
+            await tgSend(cmsg);
           }
           seenComments.add(comment.id);
+          changed = true;
         }
       }
     }
   }
 
-  firstRun = false;
+  if(changed) await saveSeenToFirebase();
+  if(!initialized) {
+    initialized = true;
+    console.log('Bot ready! Watching ' + seenTasks.size + ' tasks, ' + seenComments.size + ' comments');
+  }
 }
 
 async function main() {
-  console.log('FavorBoard bot started!');
+  console.log('FavorBoard bot starting...');
+  await loadSeenFromFirebase();
   await checkAll();
-  console.log('Ready. Watching for new tasks and comments...');
   setInterval(checkAll, 5000);
 }
 
