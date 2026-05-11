@@ -119,21 +119,21 @@ async function pollTelegram() {
 
 async function notify(text, authorUsername) {
   var authorId = userMap[authorUsername];
+  var registeredCount = Object.keys(userMap).length;
 
-  // If we have a full user map with everyone, send private to each (skip author)
-  var mappedUsers = Object.keys(userMap);
-  if(mappedUsers.length > 0 && authorId) {
-    var sent = 0;
+  if(registeredCount > 0) {
+    // Send private to all registered users except the author
     for(var u=0; u<USERS.length; u++) {
       var tgId = userMap[USERS[u]];
-      if(!tgId) continue; // not registered yet
-      if(tgId === authorId) { console.log('Skipping '+authorUsername); continue; }
+      if(!tgId) continue;
+      if(tgId === authorId) { console.log('Skipping author: '+authorUsername); continue; }
       await sendPrivate(tgId, text);
-      sent++;
     }
-    if(sent > 0) return;
+    // Never send to group when private messaging is active
+    // (group messages can't be hidden from author)
+    return;
   }
-  // Fallback: send to group
+  // No one registered yet - send to group
   await sendToGroup(text);
 }
 
