@@ -8,7 +8,7 @@ let seenTasks = new Set();
 let seenComments = new Set();
 let initialized = false;
 let lastUpdateId = 0;
-// Maps FavorBoard username -> Telegram user ID
+// Maps Dugnad username -> Telegram user ID
 // e.g. { 'User 1': 123456789 }
 let userMap = {};
 
@@ -96,7 +96,7 @@ async function pollTelegram() {
     var fromId = msg.from.id;
     var fromName = msg.from.first_name || '';
 
-    // Check if message is a valid FavorBoard username
+    // Check if message is a valid Dugnad username
     var matchedUser = null;
     for(var u=0; u<USERS.length; u++) {
       if(text.toLowerCase() === USERS[u].toLowerCase()) {
@@ -137,7 +137,7 @@ async function notify(text, authorUsername) {
   await sendToGroup(text);
 }
 
-async function checkFavorBoard() {
+async function checkDugnad() {
   const raw = await fbGet('tasks');
   if(!raw || typeof raw !== 'object') return;
 
@@ -151,7 +151,7 @@ async function checkFavorBoard() {
         var msg = '🤝 New favor from '+task.author+'\n'+task.title;
         if(task.desc) msg += '\n'+task.desc;
         if(task.deadline) msg += '\nDeadline: '+new Date(task.deadline).toLocaleString();
-        msg += '\n\nOpen FavorBoard to help!';
+        msg += '\n\nOpen Dugnad to help!';
         await notify(msg, task.author);
       }
       seenTasks.add(task.id);
@@ -168,7 +168,7 @@ async function checkFavorBoard() {
             var cm = '💬 '+c.author+' replied on "'+task.title+'"';
             if(c.text) cm += '\n'+c.text;
             if(c.imageUrl) cm += '\n[photo]';
-            cm += '\n\nOpen FavorBoard!';
+            cm += '\n\nOpen Dugnad!';
             await notify(cm, c.author);
           }
           seenComments.add(c.id);
@@ -187,10 +187,10 @@ async function checkFavorBoard() {
     var unregistered = USERS.filter(function(u){return !userMap[u];});
     if(unregistered.length > 0) {
       await sendToGroup(
-        'FavorBoard bot is running!\n\n' +
+        'Dugnad bot is running!\n\n' +
         'To stop receiving your own notifications, message me privately:\n' +
-        '1. Open @FavorBoardNotifyBot in Telegram\n' +
-        '2. Send your FavorBoard name (e.g. "User 3")\n\n' +
+        '1. Open @DugnadNotifyBot in Telegram\n' +
+        '2. Send your Dugnad name (e.g. "User 3")\n\n' +
         'Registered: '+(registered.length > 0 ? registered.join(', ') : 'none yet')
       );
     }
@@ -198,11 +198,11 @@ async function checkFavorBoard() {
 }
 
 async function main() {
-  console.log('FavorBoard bot starting...');
+  console.log('Dugnad bot starting...');
   await loadState();
-  await checkFavorBoard();
+  await checkDugnad();
   setInterval(pollTelegram, 3000);
-  setInterval(checkFavorBoard, 5000);
+  setInterval(checkDugnad, 5000);
 }
 
 main();
