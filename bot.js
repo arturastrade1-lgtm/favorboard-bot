@@ -49,10 +49,14 @@ async function notify(text, authorSlot) {
   const registeredCount = Object.keys(userMap).length;
   if (registeredCount > 0) {
     const authorTgId = authorSlot ? userMap[authorSlot] : null;
+    const sentToIds = new Set(); // prevent duplicate sends to same Telegram ID
     let sent = 0;
     for (const slotKey in userMap) {
-      if (authorSlot && userMap[slotKey] === authorTgId) { console.log('Skip author slot:', slotKey); continue; }
-      await sendPrivate(userMap[slotKey], text);
+      const tgId = userMap[slotKey];
+      if (authorSlot && tgId === authorTgId) { console.log('Skip author slot:', slotKey); continue; }
+      if (sentToIds.has(tgId)) { console.log('Skip duplicate TG ID:', tgId); continue; }
+      sentToIds.add(tgId);
+      await sendPrivate(tgId, text);
       sent++;
     }
     if (sent > 0) return;
