@@ -162,6 +162,27 @@ async function checkFavorBoard() {
       changed = true;
     }
 
+    // ── New accept notifications to owner
+    if (task.acceptedBy && initialized) {
+      for (const slotKey in task.acceptedBy) {
+        const entry = task.acceptedBy[slotKey];
+        if (!entry || entry.ownerNotified) continue;
+        const acceptorName = entry.acceptorName || slotKey;
+        const bw = entry.byWhen ? ' ' + formatByWhen(entry.byWhen) : '';
+        const msg = '✋ ' + acceptorName + ' accepted your favor "' + task.title + '"' + bw + '\n\nOpen Dugnad to follow up.';
+        const ownerSlot = findOwnerSlot(task);
+        if (ownerSlot) {
+          await notifySlot(ownerSlot, msg);
+          // Mark as notified
+          const updatedAb = Object.assign({}, task.acceptedBy);
+          updatedAb[slotKey] = Object.assign({}, entry, { ownerNotified: true });
+          await fbPatch('tasks/' + task.id, { acceptedBy: updatedAb });
+          task.acceptedBy = updatedAb;
+          changed = true;
+        }
+      }
+    }
+
     // ── New comments
     const cr = await fbGet('comments/' + task.id);
     if (cr && typeof cr === 'object') {
