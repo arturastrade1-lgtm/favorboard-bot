@@ -2,12 +2,14 @@ const DB = 'https://favor-board-default-rtdb.europe-west1.firebasedatabase.app';
 const TG_TOKEN = '7903746612:AAE2XbGDLt0tLERXf1IiGaA9OLOJytU4BsE';
 const TG_CHAT = '-5063208066';
 
-let seenTasks = new Set();
-let seenComments = new Set();
+const ALLOWED_WORKSPACES = ['arild', 'test1', 'test2']; // keep in sync with app
+
 let initialized = false;
 let lastUpdateId = 0;
-let userMap = {}; // { slot_key: telegramUserId }
-let slots = {};   // { slot_key: { username, passwordHash } }
+// Per-workspace state: { ws: { seenTasks:Set, seenComments:Set, slots:{} } }
+let wsState = {};
+// Global telegram registration: { tgId: { workspace, slotKey } }
+let botUsers = {}; // { tgId: {workspace, slotKey} }
 
 // ── Firebase helpers
 async function fbGet(path) {
@@ -15,9 +17,6 @@ async function fbGet(path) {
 }
 async function fbPatch(path, data) {
   try { await fetch(DB + '/' + path + '.json', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }); } catch {}
-}
-async function fbDelete(path) {
-  try { await fetch(DB + '/' + path + '.json', { method: 'DELETE' }); } catch {}
 }
 
 // ── Telegram helpers
@@ -44,17 +43,27 @@ async function sendGroup(text) {
   await tgPost('sendMessage', { chat_id: TG_CHAT, text });
 }
 
-// ── Notify: send to all registered users except author's slot
-async function notify(text, authorSlot) {
-  const registeredCount = Object.keys(userMap).length;
-  if (registeredCount > 0) {
+// ── Get telegram IDs registered in a given workspace, as { slotKey: tgId }
+function workspaceUserMap(ws) {
+  const map = {};
+  for (const tgId in botUsers) {
+    if (botUsers[tgId].workspace === ws) map[botUsers[tgId].slotKey] = tgId;
+  }
+  return map;
+}
+
+// ── Notify all registered users in a workspace except author
+async function notify(ws, text, authorSlot) {
+  const userMap = workspaceUserMap(ws);
+  const slotKeys = Object.keys(userMap);
+  if (slotKeys.length > 0) {
     const authorTgId = authorSlot ? userMap[authorSlot] : null;
-    const sentToIds = new Set(); // prevent duplicate sends to same Telegram ID
+    const sentToIds = new Set();
     let sent = 0;
-    for (const slotKey in userMap) {
+    for (const slotKey of slotKeys) {
       const tgId = userMap[slotKey];
-      if (authorSlot && tgId === authorTgId) { console.log('Skip author slot:', slotKey); continue; }
-      if (sentToIds.has(tgId)) { console.log('Skip duplicate TG ID:', tgId); continue; }
+      if (authorSlot && tgId === authorTgId) continue;
+      if (sentToIds.has(tgId)) continue;
       sentToIds.add(tgId);
       await sendPrivate(tgId, text);
       sent++;
@@ -64,40 +73,61 @@ async function notify(text, authorSlot) {
   await sendGroup(text);
 }
 
-// ── Notify specific slot
-async function notifySlot(slotKey, text) {
+// ── Notify a specific slot in a workspace
+async function notifySlot(ws, slotKey, text) {
+  const userMap = workspaceUserMap(ws);
   const tgId = userMap[slotKey];
   if (tgId) { await sendPrivate(tgId, text); return; }
-  // fallback to group if not registered
+  const slots = wsState[ws] ? wsState[ws].slots : {};
   const s = slots[slotKey];
   const name = s ? s.username : slotKey;
   await sendGroup(name + ': ' + text);
 }
 
-// ── Load state from Firebase
-async function loadState() {
-  const seen = await fbGet('bot_seen');
-  if (seen) {
-    if (seen.tasks) seen.tasks.forEach(id => seenTasks.add(id));
-    if (seen.comments) seen.comments.forEach(id => seenComments.add(id));
-    if (seen.lastUpdateId) lastUpdateId = seen.lastUpdateId;
+function findSlotByUsername(ws, username) {
+  const slots = wsState[ws] ? wsState[ws].slots : {};
+  for (const slotKey in slots) {
+    if (slots[slotKey] && slots[slotKey].username === username) return slotKey;
   }
-  const map = await fbGet('bot_usermap');
-  if (map) userMap = map;
-  const sl = await fbGet('user_slots');
-  if (sl) slots = sl;
-  console.log('State loaded: ' + seenTasks.size + ' tasks, ' + seenComments.size + ' comments, ' + Object.keys(userMap).length + ' registered users');
+  return null;
+}
+
+// ── Load saved state
+async function loadState() {
+  const saved = await fbGet('bot_state');
+  if (saved) {
+    if (saved.lastUpdateId) lastUpdateId = saved.lastUpdateId;
+    if (saved.workspaces) {
+      for (const ws in saved.workspaces) {
+        wsState[ws] = {
+          seenTasks: new Set(saved.workspaces[ws].tasks || []),
+          seenComments: new Set(saved.workspaces[ws].comments || []),
+          slots: {}
+        };
+      }
+    }
+  }
+  const users = await fbGet('bot_users');
+  if (users) botUsers = users;
+  // Ensure all allowed workspaces have state
+  for (const ws of ALLOWED_WORKSPACES) {
+    if (!wsState[ws]) wsState[ws] = { seenTasks: new Set(), seenComments: new Set(), slots: {} };
+  }
+  console.log('State loaded. Workspaces: ' + ALLOWED_WORKSPACES.join(', ') + '. Registered users: ' + Object.keys(botUsers).length);
 }
 
 async function saveState() {
-  await fbPatch('bot_seen', {
-    tasks: Array.from(seenTasks).slice(-1000),
-    comments: Array.from(seenComments).slice(-1000),
-    lastUpdateId
-  });
+  const workspaces = {};
+  for (const ws in wsState) {
+    workspaces[ws] = {
+      tasks: Array.from(wsState[ws].seenTasks).slice(-1000),
+      comments: Array.from(wsState[ws].seenComments).slice(-1000)
+    };
+  }
+  await fbPatch('bot_state', { lastUpdateId, workspaces });
 }
 
-// ── Poll Telegram for registrations
+// ── Poll Telegram for registrations (format: "workspace:username" or just "username")
 async function pollTelegram() {
   const d = await tgGet('getUpdates', { offset: lastUpdateId + 1, limit: 100, timeout: 0 });
   if (!d || !d.ok || !d.result || !d.result.length) return;
@@ -107,169 +137,64 @@ async function pollTelegram() {
     const msg = update.message;
     if (!msg || !msg.text || !msg.from || msg.from.is_bot) continue;
     const text = msg.text.trim();
-    const fromId = msg.from.id;
-    // Find matching slot by username
-    for (const slotKey in slots) {
-      const slot = slots[slotKey];
-      if (slot && slot.username && slot.username.toLowerCase() === text.toLowerCase()) {
-        userMap[slotKey] = fromId;
-        changed = true;
-        console.log('Registered: ' + slot.username + ' (' + slotKey + ') = TG ' + fromId);
-        await sendPrivate(fromId, 'You are registered as ' + slot.username + '. You will get Dugnad notifications here!');
-        break;
-      }
-    }
-  }
-  if (changed) await fbPatch('bot_usermap', userMap);
-}
+    const fromId = String(msg.from.id);
 
-// ── Find slot key for a username (author of task/comment)
-function findSlotByUsername(username) {
-  for (const slotKey in slots) {
-    if (slots[slotKey] && slots[slotKey].username === username) return slotKey;
-  }
-  return null;
-}
-
-// ── Find slot key for task owner
-function findOwnerSlot(task) {
-  return findSlotByUsername(task.author);
-}
-
-// ── Check all tasks and comments
-async function checkFavorBoard() {
-  // Reload slots in case new users registered
-  const sl = await fbGet('user_slots');
-  if (sl) slots = sl;
-
-  const raw = await fbGet('tasks');
-  if (!raw || typeof raw !== 'object') return;
-  const tasks = Object.entries(raw).map(([id, v]) => ({ id, ...v }));
-  let changed = false;
-
-  for (const task of tasks) {
-    // ── New task notification
-    if (!seenTasks.has(task.id)) {
-      if (initialized) {
-        const msg = '🤝 New favor from ' + task.author + '\n' + task.title +
-          (task.desc ? '\n' + task.desc : '') +
-          (task.deadline ? '\nDeadline: ' + new Date(task.deadline).toLocaleString() : '') +
-          '\n\nOpen Dugnad to help!';
-        const authorSlot = findSlotByUsername(task.author);
-        await notify(msg, authorSlot);
-      }
-      seenTasks.add(task.id);
-      changed = true;
+    // Parse "workspace:username" format
+    let ws = null, username = null;
+    if (text.includes(':')) {
+      const parts = text.split(':');
+      ws = parts[0].trim().toLowerCase();
+      username = parts.slice(1).join(':').trim();
+    } else {
+      username = text;
     }
 
-    // ── New accept notifications to owner
-    if (task.acceptedBy && initialized) {
-      for (const slotKey in task.acceptedBy) {
-        const entry = task.acceptedBy[slotKey];
-        if (!entry || entry.ownerNotified) continue;
-        const acceptorName = entry.acceptorName || slotKey;
-        const bw = entry.byWhen ? ' ' + formatByWhen(entry.byWhen) : '';
-        const msg = '✋ ' + acceptorName + ' accepted your favor "' + task.title + '"' + bw + '\n\nOpen Dugnad to follow up.';
-        const ownerSlot = findOwnerSlot(task);
-        if (ownerSlot) {
-          await notifySlot(ownerSlot, msg);
-          // Mark as notified
-          const updatedAb = Object.assign({}, task.acceptedBy);
-          updatedAb[slotKey] = Object.assign({}, entry, { ownerNotified: true });
-          await fbPatch('tasks/' + task.id, { acceptedBy: updatedAb });
-          task.acceptedBy = updatedAb;
-          changed = true;
-        }
-      }
-    }
-
-    // ── New comments
-    const cr = await fbGet('comments/' + task.id);
-    if (cr && typeof cr === 'object') {
-      const comments = Object.entries(cr).map(([id, v]) => ({ id, ...v }));
-      for (const c of comments) {
-        if (!seenComments.has(c.id)) {
-          if (initialized) {
-            const msg = '💬 ' + c.author + ' replied on "' + task.title + '"' +
-              (c.text ? '\n' + c.text : '\n[photo]') +
-              '\n\nOpen Dugnad!';
-            const authorSlot = findSlotByUsername(c.author);
-            await notify(msg, authorSlot);
+    // If workspace specified, try to register in it
+    if (ws && ALLOWED_WORKSPACES.includes(ws)) {
+      const slots = await fbGet('workspaces/' + ws + '/user_slots');
+      if (slots) {
+        let matched = false;
+        for (const slotKey in slots) {
+          if (slots[slotKey] && slots[slotKey].username && slots[slotKey].username.toLowerCase() === username.toLowerCase()) {
+            botUsers[fromId] = { workspace: ws, slotKey };
+            changed = true;
+            matched = true;
+            await sendPrivate(fromId, 'You are registered as ' + slots[slotKey].username + ' in workspace "' + ws + '". You will get Dugnad notifications here!');
+            console.log('Registered TG ' + fromId + ' as ' + username + ' in ' + ws);
+            break;
           }
-          seenComments.add(c.id);
-          changed = true;
         }
+        if (!matched) {
+          await sendPrivate(fromId, 'Could not find "' + username + '" in workspace "' + ws + '". Make sure you registered in the app first, then send: ' + ws + ':YourName');
+        }
+      } else {
+        await sendPrivate(fromId, 'Workspace "' + ws + '" has no users yet. Register in the app first.');
       }
-    }
-
-    // ── Smart reminders for accepted tasks
-    if (task.acceptedBy && task.status !== 'done') {
-      for (const slotKey in task.acceptedBy) {
-        const entry = task.acceptedBy[slotKey];
-        if (!entry || !entry.reminders || !entry.reminders.length) continue;
-        if (entry.reminderType === 'off') continue;
-
-        const remindersSet = entry.remindersSet || [];
-        let reminderChanged = false;
-
-        for (const reminderTime of entry.reminders) {
-          const reminderId = task.id + '_' + slotKey + '_' + reminderTime;
-          if (remindersSet.includes(reminderTime)) continue; // already sent
-          if (Date.now() < reminderTime) continue; // not yet
-          if (Date.now() > reminderTime + 3600000) { // more than 1 hour late - skip
-            remindersSet.push(reminderTime);
-            reminderChanged = true;
-            continue;
+    } else if (ws) {
+      await sendPrivate(fromId, 'Unknown workspace "' + ws + '". Please check the code with your admin.');
+    } else {
+      // No workspace specified - search all workspaces for the username
+      let found = false;
+      for (const w of ALLOWED_WORKSPACES) {
+        const slots = await fbGet('workspaces/' + w + '/user_slots');
+        if (!slots) continue;
+        for (const slotKey in slots) {
+          if (slots[slotKey] && slots[slotKey].username && slots[slotKey].username.toLowerCase() === username.toLowerCase()) {
+            botUsers[fromId] = { workspace: w, slotKey };
+            changed = true; found = true;
+            await sendPrivate(fromId, 'You are registered as ' + slots[slotKey].username + ' in workspace "' + w + '". You will get Dugnad notifications here!');
+            console.log('Registered TG ' + fromId + ' as ' + username + ' in ' + w + ' (auto-detected)');
+            break;
           }
-          // Send reminder to acceptor
-          const name = entry.acceptorName || slotKey;
-          const msg = '⏰ Reminder: You accepted to do "' + task.title + '" ' + formatByWhen(entry.byWhen) + '\n\nOpen Dugnad to mark it done!';
-          await notifySlot(slotKey, msg);
-          remindersSet.push(reminderTime);
-          reminderChanged = true;
-          console.log('Sent reminder to ' + name + ' for task ' + task.title);
         }
-
-        if (reminderChanged) {
-          const updatedAb = Object.assign({}, task.acceptedBy);
-          updatedAb[slotKey] = Object.assign({}, entry, { remindersSet });
-          await fbPatch('tasks/' + task.id, { acceptedBy: updatedAb });
-        }
+        if (found) break;
       }
-    }
-
-    // ── Overdue notification to owner (not acceptor)
-    if (task.status !== 'done' && task.acceptedBy) {
-      for (const slotKey in task.acceptedBy) {
-        const entry = task.acceptedBy[slotKey];
-        if (!entry || !entry.byWhen) continue;
-        if (Date.now() < entry.byWhen) continue; // not overdue yet
-        if (entry.overdueNotified) continue; // already notified owner
-
-        // Notify owner only
-        const ownerSlot = findOwnerSlot(task);
-        const acceptorName = entry.acceptorName || slotKey;
-        const msg = '⚠️ ' + acceptorName + ' accepted your favor "' + task.title + '" but hasn\'t marked it done yet.\n\nOpen Dugnad to follow up.';
-        if (ownerSlot) {
-          await notifySlot(ownerSlot, msg);
-        } else {
-          await sendGroup(msg);
-        }
-
-        // Mark as overdue-notified
-        const updatedAb = Object.assign({}, task.acceptedBy);
-        updatedAb[slotKey] = Object.assign({}, entry, { overdueNotified: true });
-        await fbPatch('tasks/' + task.id, { acceptedBy: updatedAb });
-        console.log('Notified owner about overdue: ' + task.title);
+      if (!found) {
+        await sendPrivate(fromId, 'Could not find "' + username + '". Please send your workspace and name like this: arild:YourName');
       }
     }
   }
-
-  if (changed) await saveState();
-  if (!initialized) {
-    initialized = true;
-    console.log('Bot ready! Watching ' + seenTasks.size + ' tasks');
-  }
+  if (changed) await fbPatch('bot_users', botUsers);
 }
 
 function formatByWhen(ts) {
@@ -282,13 +207,125 @@ function formatByWhen(ts) {
   return 'by ' + d.toLocaleDateString();
 }
 
+// ── Check one workspace
+async function checkWorkspace(ws) {
+  const state = wsState[ws];
+  if (!state) return;
+
+  // Reload slots
+  const sl = await fbGet('workspaces/' + ws + '/user_slots');
+  if (sl) state.slots = sl;
+
+  const raw = await fbGet('workspaces/' + ws + '/tasks');
+  if (!raw || typeof raw !== 'object') return;
+  const tasks = Object.entries(raw).map(([id, v]) => ({ id, ...v }));
+
+  for (const task of tasks) {
+    // New task
+    if (!state.seenTasks.has(task.id)) {
+      if (initialized) {
+        const msg = '🤝 New favor from ' + task.author + '\n' + task.title +
+          (task.desc ? '\n' + task.desc : '') +
+          (task.deadline ? '\nDeadline: ' + new Date(task.deadline).toLocaleString() : '') +
+          '\n\nOpen Dugnad to help!';
+        await notify(ws, msg, findSlotByUsername(ws, task.author));
+      }
+      state.seenTasks.add(task.id);
+    }
+
+    // New accept → notify owner
+    if (task.acceptedBy && initialized) {
+      for (const slotKey in task.acceptedBy) {
+        const entry = task.acceptedBy[slotKey];
+        if (!entry || entry.ownerNotified) continue;
+        const acceptorName = entry.acceptorName || slotKey;
+        const bw = entry.byWhen ? ' ' + formatByWhen(entry.byWhen) : '';
+        const ownerSlot = findSlotByUsername(ws, task.author);
+        if (ownerSlot) {
+          await notifySlot(ws, ownerSlot, '✋ ' + acceptorName + ' accepted your favor "' + task.title + '"' + bw + '\n\nOpen Dugnad to follow up.');
+          const updatedAb = Object.assign({}, task.acceptedBy);
+          updatedAb[slotKey] = Object.assign({}, entry, { ownerNotified: true });
+          await fbPatch('workspaces/' + ws + '/tasks/' + task.id, { acceptedBy: updatedAb });
+          task.acceptedBy = updatedAb;
+        }
+      }
+    }
+
+    // New comments
+    const cr = await fbGet('workspaces/' + ws + '/comments/' + task.id);
+    if (cr && typeof cr === 'object') {
+      const comments = Object.entries(cr).map(([id, v]) => ({ id, ...v }));
+      for (const c of comments) {
+        if (!state.seenComments.has(c.id)) {
+          if (initialized) {
+            const msg = '💬 ' + c.author + ' replied on "' + task.title + '"' +
+              (c.text ? '\n' + c.text : '\n[photo]') + '\n\nOpen Dugnad!';
+            await notify(ws, msg, findSlotByUsername(ws, c.author));
+          }
+          state.seenComments.add(c.id);
+        }
+      }
+    }
+
+    // Smart reminders for acceptors
+    if (task.acceptedBy && task.status !== 'done') {
+      for (const slotKey in task.acceptedBy) {
+        const entry = task.acceptedBy[slotKey];
+        if (!entry || !entry.reminders || !entry.reminders.length) continue;
+        if (entry.reminderType === 'off') continue;
+        const remindersSet = entry.remindersSet || [];
+        let reminderChanged = false;
+        for (const reminderTime of entry.reminders) {
+          if (remindersSet.includes(reminderTime)) continue;
+          if (Date.now() < reminderTime) continue;
+          if (Date.now() > reminderTime + 3600000) { remindersSet.push(reminderTime); reminderChanged = true; continue; }
+          const msg = '⏰ Reminder: You accepted to do "' + task.title + '" ' + formatByWhen(entry.byWhen) + '\n\nOpen Dugnad to mark it done!';
+          await notifySlot(ws, slotKey, msg);
+          remindersSet.push(reminderTime);
+          reminderChanged = true;
+        }
+        if (reminderChanged) {
+          const updatedAb = Object.assign({}, task.acceptedBy);
+          updatedAb[slotKey] = Object.assign({}, entry, { remindersSet });
+          await fbPatch('workspaces/' + ws + '/tasks/' + task.id, { acceptedBy: updatedAb });
+        }
+      }
+    }
+
+    // Overdue → notify owner only
+    if (task.status !== 'done' && task.acceptedBy) {
+      for (const slotKey in task.acceptedBy) {
+        const entry = task.acceptedBy[slotKey];
+        if (!entry || !entry.byWhen) continue;
+        if (Date.now() < entry.byWhen) continue;
+        if (entry.overdueNotified) continue;
+        const ownerSlot = findSlotByUsername(ws, task.author);
+        const acceptorName = entry.acceptorName || slotKey;
+        const msg = '⚠️ ' + acceptorName + ' accepted your favor "' + task.title + '" but hasn\'t marked it done yet.\n\nOpen Dugnad to follow up.';
+        if (ownerSlot) await notifySlot(ws, ownerSlot, msg);
+        else await sendGroup(msg);
+        const updatedAb = Object.assign({}, task.acceptedBy);
+        updatedAb[slotKey] = Object.assign({}, entry, { overdueNotified: true });
+        await fbPatch('workspaces/' + ws + '/tasks/' + task.id, { acceptedBy: updatedAb });
+      }
+    }
+  }
+}
+
+async function checkAll() {
+  for (const ws of ALLOWED_WORKSPACES) {
+    await checkWorkspace(ws);
+  }
+  await saveState();
+  if (!initialized) { initialized = true; console.log('Bot ready! Watching ' + ALLOWED_WORKSPACES.length + ' workspaces'); }
+}
+
 async function main() {
-  console.log('Dugnad bot starting...');
+  console.log('Dugnad multi-workspace bot starting...');
   await loadState();
-  await checkFavorBoard();
+  await checkAll();
   setInterval(pollTelegram, 5000);
-  setInterval(checkFavorBoard, 10000); // check every 10s for reminders
-  setInterval(async () => { const sl = await fbGet('user_slots'); if (sl) slots = sl; }, 60000);
+  setInterval(checkAll, 10000);
 }
 
 main();
